@@ -232,9 +232,11 @@ export class LiquidationBot {
         await (await erc20.approve(spender, capital)).wait()
       }
       // Simulated in the latest block first: a position repaid or liquidated by someone
-      // else in the meantime costs nothing.
-      await vault.liquidatePartial.staticCall(borrower, capital)
-      const receipt = await (await vault.liquidatePartial(borrower, capital)).wait()
+      // else in the meantime costs nothing. The vault accrues interest once per second, so a
+      // transaction estimated in the second of the vault's last operation needs more gas when
+      // it lands in the next one: half as much again is allowed, unused gas is not charged.
+      const gas = await vault.liquidatePartial.estimateGas(borrower, capital)
+      const receipt = await (await vault.liquidatePartial(borrower, capital, { gasLimit: gas * 3n / 2n })).wait()
       if (receipt.status !== 1) throw new Error('transaction reverted')
       const event = receipt.logs.map((log) => { try { return vault.interface.parseLog(log) } catch { return null } })
         .find((log) => log?.name === 'Liquidated')
