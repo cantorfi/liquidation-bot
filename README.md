@@ -39,7 +39,9 @@ CHAIN_ID=84532 \
 npm start -- --once
 ```
 
-The bot lists every vault and every position that can be liquidated now. Public RPCs cap log queries, so the first pass reads the history in chunks and takes a few minutes; the state file then keeps the borrower list and the next passes take seconds.
+The bot lists every vault and every position that can be liquidated now.
+
+The first scan is long on the public RPC: it limits each log query to 200 blocks, so reading the whole history since the deployment block takes several hours per vault. Progress is saved in the state file (`cantorfi-liquidation-state.json`): the scan can be stopped and resumed, and later passes take seconds. An RPC that accepts wider log ranges needs far fewer requests.
 
 ## Liquidate with your wallet
 
