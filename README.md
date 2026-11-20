@@ -32,26 +32,28 @@ git clone https://github.com/cantorfi/liquidation-bot.git
 cd liquidation-bot
 npm install
 
-RPC_URL=https://sepolia.base.org \
+RPC_URL=https://base-sepolia.gateway.tenderly.co \
 PROTOCOL_ADDRESS=0x81dEe1B70a19C752c813BE537BCCa440CCafD428 \
 FROM_BLOCK=47408113 \
 CHAIN_ID=84532 \
+LOG_RANGE=1000000 \
 npm start -- --once
 ```
 
 The bot lists every vault and every position that can be liquidated now.
 
-The first scan takes about 40 minutes on the public RPC: it limits each log query to 200 blocks, so the first pass reads the whole history since the deployment block in about 40 minutes for all vaults together, printing a `scan` line as it goes. Progress is saved in the state file (`cantorfi-liquidation-state.json`): Ctrl+C stops the scan, the next start resumes it, and later passes take seconds. An RPC that accepts wider log ranges needs far fewer requests, as long as it still holds the logs since the deployment block.
+The first pass reads every `Borrowed` event since the deployment block, so it depends on the RPC. The one in the command above is free, needs no key and serves that history in wide ranges: the first pass took 6 seconds on 20 November 2026. On `https://sepolia.base.org`, limited to 200 blocks per log query, the same pass took 39 minutes that day and grows by about a minute per day of chain history, printing a `scan` line as it goes. Progress is saved in the state file (`cantorfi-liquidation-state.json`): Ctrl+C stops the scan, the next start resumes it, and later passes take seconds.
 
 ## Liquidate with your wallet
 
 Use a wallet dedicated to the bot, holding only the capital you accept to use and some ETH for gas. Add the key and `EXECUTE=1`, then leave it watching:
 
 ```bash
-RPC_URL=https://sepolia.base.org \
+RPC_URL=https://base-sepolia.gateway.tenderly.co \
 PROTOCOL_ADDRESS=0x81dEe1B70a19C752c813BE537BCCa440CCafD428 \
 FROM_BLOCK=47408113 \
 CHAIN_ID=84532 \
+LOG_RANGE=1000000 \
 LIQUIDATOR_PRIVATE_KEY=<your dedicated wallet key> \
 EXECUTE=1 \
 MAX_REPAY=1000 \
@@ -83,7 +85,7 @@ There is no zero-capital liquidation: your wallet must hold the vault's token (U
 | `MIN_PROFIT` | Optional | Minimum profit per liquidation, in the vault token (default 0). |
 | `INTERVAL_SECONDS` | Optional | Delay between passes in watch mode (default 30). |
 | `CONFIRMATIONS` / `REORG_DEPTH` | Optional | Blocks behind head, and blocks rescanned each pass (defaults 2 and 64). |
-| `LOG_RANGE` | Optional | Blocks per `eth_getLogs` request (default 2000, lowered automatically to the limit the RPC states). |
+| `LOG_RANGE` | Optional | Blocks per `eth_getLogs` request (default 2000; a larger value is lowered automatically to the limit the RPC states). |
 | `SCAN_PARALLEL` | Optional | Block ranges requested at a time during the scan (default 16). |
 | `STATE_FILE` | Optional | Borrower cache; keep it so restarts only scan new blocks. |
 
