@@ -54,6 +54,7 @@ const VAULT_ABI = [
   'function liquidationsPaused() view returns (bool)',
   'function previewLiquidation(address borrower, uint256 maxRepayAmount) view returns (uint256 repayAmount, uint256 collateralSeized, uint256 liquidatorPayout, uint256 protocolFee, uint256 badDebt)',
   'function liquidatePartial(address borrower, uint256 maxRepayAmount)',
+  'function getTotalDebt(address user) view returns (uint256)',
 ]
 const ERC20_ABI = [
   'function symbol() view returns (string)',
@@ -64,6 +65,10 @@ const ERC20_ABI = [
 ]
 
 const BORROWED = ethers.id('Borrowed(address,uint256)')
+// Multicall3 sits at this address on every major chain: READ_BATCH positions are read per request.
+const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11'
+const MULTICALL = new ethers.Interface(['function aggregate3((address target, bool allowFailure, bytes callData)[] calls) view returns ((bool success, bytes returnData)[])'])
+const READ_BATCH = 200
 
 // The RPC's own words ("eth_getLogs is limited to a 200 range", "pruned history unavailable").
 // ethers hides them behind "could not coalesce error", or in the body of an HTTP 413.
@@ -172,15 +177,18 @@ export class LiquidationBot {
     return this.tokens.get(key)
   }
 
-  // Every address that ever borrowed, per vault. One eth_getLogs covers all the vaults and
-  // SCAN_PARALLEL block ranges are requested at a time. The sets only grow, so a reorg can at
-  // worst delay a borrower until the overlap window rescans it.
+  // Every address with a Borrowed event, per vault. One eth_getLogs covers all the vaults and
+  // SCAN_PARALLEL block ranges are requested at a time. The scan only adds addresses, so a reorg
+  // can at worst delay a borrower until the overlap window rescans it; forget() drops the
+  // positions that are closed.
   async scan(vaults, head) {
+    this.lastScan = null
     const entries = new Map(vaults.map((vault) => {
       const key = vault.target.toLowerCase()
       return [key, this.state.vaults[key] ||= { cursor: this.config.fromBlock, borrowers: [] }]
     }))
     const known = new Map([...entries].map(([key, entry]) => [key, new Set(entry.borrowers)]))
+    const recent = new Map([...entries.keys()].map((key) => [key, new Set()]))
     if (!entries.size) return known
     const save = async (cursor) => {
       for (const [key, entry] of entries) {
@@ -191,6 +199,8 @@ export class LiquidationBot {
     }
     const filter = { address: [...entries.keys()], topics: [BORROWED] }
     const safeHead = head - this.config.confirmations
+    // The last block no reorg can change any more; forget() reads the debts there.
+    const settled = safeHead - this.config.reorgDepth
     // A vault listed for the first time restarts the scan at FROM_BLOCK for every vault: same
     // number of requests as scanning it alone.
     let from = Math.max(this.config.fromBlock, Math.min(...[...entries.values()].map((entry) => entry.cursor)) - this.config.reorgDepth)
@@ -211,7 +221,12 @@ export class LiquidationBot {
         this.logRange = limit >= 1 && limit < this.logRange ? limit : Math.floor(this.logRange / 2)
         continue
       }
-      for (const log of pages.flat()) known.get(log.address.toLowerCase())?.add(ethers.getAddress(ethers.dataSlice(log.topics[1], 12)))
+      for (const log of pages.flat()) {
+        const key = log.address.toLowerCase()
+        const borrower = ethers.getAddress(ethers.dataSlice(log.topics[1], 12))
+        known.get(key)?.add(borrower)
+        if (log.blockNumber > settled) recent.get(key)?.add(borrower)
+      }
       from = ranges.at(-1)[1] + 1
       if (++rounds % 25 === 0) {
         await save(from)
@@ -219,7 +234,57 @@ export class LiquidationBot {
       }
     }
     await save(from)
+    this.lastScan = { settled, recent, complete: from > safeHead }
     return new Map([...known].map(([key, borrowers]) => [key, [...borrowers]]))
+  }
+
+  // One vault function read for many borrowers: READ_BATCH of them per request through
+  // Multicall3, one request each on a chain without it. A read the vault refuses is null.
+  async readAll(vault, method, argsOf, borrowers, blockTag = 'latest') {
+    this.batched ??= await this.provider.getCode(MULTICALL3) !== '0x'
+    const requests = borrowers.map((borrower) => vault.interface.encodeFunctionData(method, argsOf(borrower)))
+    const decode = (data) => { try { return vault.interface.decodeFunctionResult(method, data) } catch { return null } }
+    const answers = []
+    if (!this.batched) {
+      for (const data of requests) {
+        answers.push(await this.provider.call({ to: vault.target, data, blockTag }).then(decode, (error) => {
+          if (error.code === 'CALL_EXCEPTION') return null
+          throw error
+        }))
+      }
+      return answers
+    }
+    for (let index = 0; index < requests.length; index += READ_BATCH) {
+      const calls = requests.slice(index, index + READ_BATCH).map((callData) => ({ target: vault.target, allowFailure: true, callData }))
+      const data = await this.provider.call({ to: MULTICALL3, data: MULTICALL.encodeFunctionData('aggregate3', [calls]), blockTag })
+      const [replies] = MULTICALL.decodeFunctionResult('aggregate3', data)
+      for (const reply of replies) answers.push(reply.success ? decode(reply.returnData) : null)
+    }
+    return answers
+  }
+
+  // Only the positions that still owe something stay listed.
+  // An address whose debt was zero REORG_DEPTH blocks behind the scan, and that has not borrowed
+  // since, leaves the list: no reorg can undo it, and borrowing again emits a Borrowed event that
+  // the scan picks up. Otherwise every address that ever borrowed would be read on every pass.
+  async forget(vaults, borrowersOf) {
+    const { settled, recent, complete } = this.lastScan ?? {}
+    if (!complete || settled < this.config.fromBlock) return
+    let forgotten = false
+    for (const vault of vaults) {
+      const key = vault.target.toLowerCase()
+      const candidates = borrowersOf.get(key).filter((borrower) => !recent.get(key).has(borrower))
+      if (!candidates.length) continue
+      // No answer (older vault version, RPC without that block's state): the address stays.
+      const debts = await this.readAll(vault, 'getTotalDebt', (borrower) => [borrower], candidates, settled).catch(() => [])
+      const closed = new Set(candidates.filter((_borrower, index) => debts[index]?.[0] === 0n))
+      if (!closed.size) continue
+      const open = borrowersOf.get(key).filter((borrower) => !closed.has(borrower))
+      borrowersOf.set(key, open)
+      this.state.vaults[key].borrowers = open
+      forgotten = true
+    }
+    if (forgotten) await this.save()
   }
 
   async liquidate(vault, token, borrower, capital) {
@@ -255,6 +320,7 @@ export class LiquidationBot {
     let borrowersOf
     try {
       borrowersOf = await this.scan(vaults, head)
+      await this.forget(vaults, borrowersOf)
     } catch (error) {
       emit('error', { message: error.shortMessage || error.message })
       return results
@@ -279,9 +345,14 @@ export class LiquidationBot {
         emit('vault', { vault: address, token: token.symbol, borrowers: borrowers.length, liquidationsPaused: paused,
           ...(this.config.execute ? { capital: format(capital) } : {}) })
         const minProfit = ethers.parseUnits(this.config.minProfit, token.decimals)
-        for (const borrower of borrowers) {
+        // Every position is previewed in a few grouped requests; a position that comes out
+        // liquidatable is previewed again alone, with the capital left after earlier liquidations.
+        const preview = (borrower) => [borrower, capital > 0n ? capital : ethers.MaxUint256]
+        const healthy = await this.readAll(vault, 'previewLiquidation', preview, borrowers)
+        for (const [index, borrower] of borrowers.entries()) {
           if (this.stopped) return results
-          const quote = await vault.previewLiquidation(borrower, capital > 0n ? capital : ethers.MaxUint256)
+          if (healthy[index]?.repayAmount === 0n) continue
+          const quote = await vault.previewLiquidation(...preview(borrower))
           if (quote.repayAmount === 0n) continue
           const profit = quote.liquidatorPayout > quote.repayAmount ? quote.liquidatorPayout - quote.repayAmount : 0n
           const opportunity = { vault: address, borrower, token: token.symbol, repay: format(quote.repayAmount),

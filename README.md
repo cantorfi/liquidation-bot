@@ -67,8 +67,8 @@ There is no zero-capital liquidation: your wallet must hold the vault's token (U
 
 ## How one pass works
 
-1. **Discover.** The bot reads the vault list from the protocol registry, then every `Borrowed` event since the deployment block. Borrowers are cached in a state file, so later passes only scan new blocks.
-2. **Preview.** For each borrower it calls `previewLiquidation`: the exact amount to repay, the collateral you receive, your profit and any bad debt, at the current block. A healthy position returns zero and is skipped.
+1. **Discover.** The bot reads the vault list from the protocol registry, then every `Borrowed` event since the deployment block. Borrowers are cached in a state file, so later passes only scan new blocks. A position that is fully repaid or liquidated leaves the list; borrowing again brings it back.
+2. **Preview.** For each open position it calls `previewLiquidation`, 200 positions per request: the exact amount to repay, the collateral you receive, your profit and any bad debt, at the current block. A healthy position returns zero and is skipped.
 3. **Liquidate** (only with `EXECUTE=1`). It approves exactly the capital needed, simulates `liquidatePartial` in the latest block, sends it, then resets the approval to zero. A position already repaid or liquidated by someone else fails in simulation and costs nothing.
 
 ## Configuration
