@@ -42,7 +42,7 @@ npm start -- --once
 
 The bot lists every vault and every position that can be liquidated now.
 
-The first pass reads every `Borrowed` event since the deployment block, so it depends on the RPC. The one in the command above is free, needs no key and serves that history in wide ranges: the first pass took 6 seconds on 20 November 2026. On `https://sepolia.base.org`, limited to 200 blocks per log query, the same pass took 39 minutes that day and grows by about a minute per day of chain history, printing a `scan` line as it goes. Progress is saved in the state file (`cantorfi-liquidation-state.json`): Ctrl+C stops the scan, the next start resumes it, and later passes take seconds.
+The first pass reads every `Borrowed` event since the deployment block, so it depends on the RPC. The one in the command above is free, needs no key and serves that history in wide ranges: the first pass took under 15 seconds on 20 November 2026. On `https://sepolia.base.org`, limited to 200 blocks per log query, the same pass took 39 minutes that day and grows by about a minute per day of chain history, printing a `scan` line as it goes. Progress is saved in the state file (`cantorfi-liquidation-state.json`): Ctrl+C stops the scan, the next start resumes it, and later passes take seconds.
 
 ## Liquidate with your wallet
 
