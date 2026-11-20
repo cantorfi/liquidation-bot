@@ -41,7 +41,7 @@ npm start -- --once
 
 The bot lists every vault and every position that can be liquidated now.
 
-The first scan is long on the public RPC: it limits each log query to 200 blocks, so reading the whole history since the deployment block takes several hours per vault. Progress is saved in the state file (`cantorfi-liquidation-state.json`): the scan can be stopped and resumed, and later passes take seconds. An RPC that accepts wider log ranges needs far fewer requests.
+The first scan takes about 40 minutes on the public RPC: it limits each log query to 200 blocks, so the first pass reads the whole history since the deployment block in about 40 minutes for all vaults together, printing a `scan` line as it goes. Progress is saved in the state file (`cantorfi-liquidation-state.json`): Ctrl+C stops the scan, the next start resumes it, and later passes take seconds. An RPC that accepts wider log ranges needs far fewer requests, as long as it still holds the logs since the deployment block.
 
 ## Liquidate with your wallet
 
@@ -83,14 +83,15 @@ There is no zero-capital liquidation: your wallet must hold the vault's token (U
 | `MIN_PROFIT` | Optional | Minimum profit per liquidation, in the vault token (default 0). |
 | `INTERVAL_SECONDS` | Optional | Delay between passes in watch mode (default 30). |
 | `CONFIRMATIONS` / `REORG_DEPTH` | Optional | Blocks behind head, and blocks rescanned each pass (defaults 2 and 64). |
-| `LOG_RANGE` | Optional | Blocks per `eth_getLogs` request (default 2000, halved automatically if the RPC refuses). |
+| `LOG_RANGE` | Optional | Blocks per `eth_getLogs` request (default 2000, lowered automatically to the limit the RPC states). |
+| `SCAN_PARALLEL` | Optional | Block ranges requested at a time during the scan (default 16). |
 | `STATE_FILE` | Optional | Borrower cache; keep it so restarts only scan new blocks. |
 
 `--once` runs a single pass and exits; without it the bot runs a pass every `INTERVAL_SECONDS` until Ctrl+C. `--help` prints this list.
 
 ## Output
 
-Every line is one JSON event, easy to pipe into your own alerts: `started`, `vault`, `opportunity`, `skipped` (with its reason), `executed` and `error`.
+Every line is one JSON event, easy to pipe into your own alerts: `started`, `scan` (progress of a long scan), `vault`, `opportunity`, `skipped` (with its reason), `executed` and `error`.
 
 ```json
 {"event":"started","chainId":"84532","mode":"read-only","liquidator":null}

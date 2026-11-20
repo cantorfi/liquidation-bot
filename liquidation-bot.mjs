@@ -37,10 +37,11 @@ Optional
   INTERVAL_SECONDS         delay between passes (default 30)
   CONFIRMATIONS            blocks behind head before a borrower is scanned (default 2)
   REORG_DEPTH              blocks rescanned on every pass (default 64)
-  LOG_RANGE                blocks per eth_getLogs request (default 2000)
+  LOG_RANGE                blocks per eth_getLogs request (default 2000, lowered to the RPC's limit)
+  SCAN_PARALLEL            block ranges requested at a time during the scan (default 16)
   STATE_FILE               borrower cache (default ./cantorfi-liquidation-state.json)
 
-Every line of output is one JSON event: vault, opportunity, skipped, executed, error.`
+Every line of output is one JSON event: started, scan, vault, opportunity, skipped, executed, error.`
 
 const PROTOCOL_ABI = [
   'function vaultCount() view returns (uint256)',
@@ -61,6 +62,23 @@ const ERC20_ABI = [
   'function allowance(address owner, address spender) view returns (uint256)',
   'function approve(address spender, uint256 amount) returns (bool)',
 ]
+
+const BORROWED = ethers.id('Borrowed(address,uint256)')
+
+// The RPC's own words ("eth_getLogs is limited to a 200 range", "pruned history unavailable").
+// ethers hides them behind "could not coalesce error", or in the body of an HTTP 413.
+function rpcMessage(error) {
+  let stated
+  try { stated = JSON.parse(error.info.responseBody).error.message } catch { stated = error?.info?.responseBody }
+  return stated || error?.error?.message || error?.info?.error?.message || error?.shortMessage || error?.message || String(error)
+}
+
+// Public RPCs cap eth_getLogs differently and say so: "limited to a 200 range", "maximum block
+// range: 50000", "ranges over 100 blocks", "up to a 10 block range".
+function rangeLimit(message) {
+  const found = /(\d[\d,]*)\s*(?:block|range)|(?:range|blocks)\D{0,10}(\d[\d,]*)/i.exec(message)
+  return found ? Number((found[1] ?? found[2]).replaceAll(',', '')) : 0
+}
 
 const emit = (event, fields = {}) => console.log(JSON.stringify({ at: new Date().toISOString(), event, ...fields }, (_key, value) => typeof value === 'bigint' ? value.toString() : value))
 
@@ -91,6 +109,7 @@ function readConfig() {
     confirmations: integer('CONFIRMATIONS', 2, 0),
     reorgDepth: integer('REORG_DEPTH', 64, 1),
     logRange: integer('LOG_RANGE', 2000, 1),
+    scanParallel: integer('SCAN_PARALLEL', 16, 1),
     stateFile: env.STATE_FILE || './cantorfi-liquidation-state.json',
   }
   if (config.reorgDepth <= config.confirmations) throw new Error('REORG_DEPTH must exceed CONFIRMATIONS')
@@ -100,11 +119,14 @@ function readConfig() {
 export class LiquidationBot {
   constructor(config) {
     this.config = config
-    this.provider = new ethers.JsonRpcProvider(config.rpcUrl, undefined, { batchMaxCount: 1 })
+    // No request cache: ethers would otherwise answer a nonce, balance or allowance read with a
+    // value up to 250 ms old, which is stale right after a transaction on a fast chain.
+    this.provider = new ethers.JsonRpcProvider(config.rpcUrl, undefined, { batchMaxCount: 1, cacheTimeout: -1 })
     this.signer = config.privateKey ? new ethers.Wallet(config.privateKey, this.provider) : null
     this.protocol = new ethers.Contract(config.protocol, PROTOCOL_ABI, this.provider)
     this.tokens = new Map()
     this.state = null
+    this.stopped = false
     this.logRange = config.logRange
   }
 
@@ -150,34 +172,54 @@ export class LiquidationBot {
     return this.tokens.get(key)
   }
 
-  // Every address that ever borrowed from the vault. The set only grows, so a reorg can
-  // at worst delay a borrower until the overlap window rescans it.
-  async borrowers(vault, head) {
-    const key = vault.target.toLowerCase()
-    const entry = this.state.vaults[key] ||= { cursor: this.config.fromBlock, borrowers: [] }
-    const known = new Set(entry.borrowers)
+  // Every address that ever borrowed, per vault. One eth_getLogs covers all the vaults and
+  // SCAN_PARALLEL block ranges are requested at a time. The sets only grow, so a reorg can at
+  // worst delay a borrower until the overlap window rescans it.
+  async scan(vaults, head) {
+    const entries = new Map(vaults.map((vault) => {
+      const key = vault.target.toLowerCase()
+      return [key, this.state.vaults[key] ||= { cursor: this.config.fromBlock, borrowers: [] }]
+    }))
+    const known = new Map([...entries].map(([key, entry]) => [key, new Set(entry.borrowers)]))
+    if (!entries.size) return known
+    const save = async (cursor) => {
+      for (const [key, entry] of entries) {
+        entry.borrowers = [...known.get(key)]
+        if (cursor > entry.cursor) entry.cursor = cursor
+      }
+      await this.save()
+    }
+    const filter = { address: [...entries.keys()], topics: [BORROWED] }
     const safeHead = head - this.config.confirmations
-    let from = Math.max(this.config.fromBlock, entry.cursor - this.config.reorgDepth)
-    let chunks = 0
-    while (from <= safeHead) {
-      const to = Math.min(from + this.logRange - 1, safeHead)
-      let logs
+    // A vault listed for the first time restarts the scan at FROM_BLOCK for every vault: same
+    // number of requests as scanning it alone.
+    let from = Math.max(this.config.fromBlock, Math.min(...[...entries.values()].map((entry) => entry.cursor)) - this.config.reorgDepth)
+    let rounds = 0
+    while (from <= safeHead && !this.stopped) {
+      const ranges = []
+      for (let start = from; start <= safeHead && ranges.length < this.config.scanParallel; start += this.logRange) {
+        ranges.push([start, Math.min(start + this.logRange - 1, safeHead)])
+      }
+      let pages
       try {
-        logs = await vault.queryFilter(vault.filters.Borrowed(), from, to)
+        pages = await Promise.all(ranges.map(([fromBlock, toBlock]) => this.provider.getLogs({ ...filter, fromBlock, toBlock })))
       } catch (error) {
-        // Public RPCs cap eth_getLogs differently: halve the range and retry the same blocks.
-        if (this.logRange === 1) throw error
-        this.logRange = Math.max(1, Math.floor(this.logRange / 2))
+        const message = rpcMessage(error)
+        if (this.logRange === 1) throw new Error(`eth_getLogs refused block ${from}: ${message}`)
+        // Take the limit the RPC states; without one, halve the range and retry the same blocks.
+        const limit = rangeLimit(message)
+        this.logRange = limit >= 1 && limit < this.logRange ? limit : Math.floor(this.logRange / 2)
         continue
       }
-      for (const log of logs) known.add(ethers.getAddress(log.args.borrower))
-      entry.cursor = to + 1
-      from = to + 1
-      if (++chunks % 25 === 0) { entry.borrowers = [...known]; await this.save() }
+      for (const log of pages.flat()) known.get(log.address.toLowerCase())?.add(ethers.getAddress(ethers.dataSlice(log.topics[1], 12)))
+      from = ranges.at(-1)[1] + 1
+      if (++rounds % 25 === 0) {
+        await save(from)
+        emit('scan', { block: from, head: safeHead, blocksPerRequest: this.logRange })
+      }
     }
-    entry.borrowers = [...known]
-    await this.save()
-    return entry.borrowers
+    await save(from)
+    return new Map([...known].map(([key, borrowers]) => [key, [...borrowers]]))
   }
 
   async liquidate(vault, token, borrower, capital) {
@@ -207,13 +249,24 @@ export class LiquidationBot {
     if (!this.state) await this.initialize()
     const head = await this.provider.getBlockNumber()
     const results = []
-    for (const address of await this.vaults()) {
-      const vault = new ethers.Contract(address, VAULT_ABI, this.signer ?? this.provider)
+    const vaults = (await this.vaults()).map((address) => new ethers.Contract(address, VAULT_ABI, this.signer ?? this.provider))
+    let borrowersOf
+    try {
+      borrowersOf = await this.scan(vaults, head)
+    } catch (error) {
+      emit('error', { message: error.shortMessage || error.message })
+      return results
+    }
+    // Stopped during the scan: progress is saved, the next start resumes there.
+    if (this.stopped) return results
+    for (const vault of vaults) {
+      const address = vault.target
       try {
         const token = await this.token(vault)
+        const borrowers = borrowersOf.get(address.toLowerCase())
         // Older vault versions have no pause flag; the contract still refuses a paused
         // liquidation, and every transaction is simulated first.
-        const [borrowers, paused] = await Promise.all([this.borrowers(vault, head), vault.liquidationsPaused().catch(() => false)])
+        const paused = await vault.liquidationsPaused().catch(() => false)
         const format = (value) => ethers.formatUnits(value, token.decimals)
         let capital = ethers.MaxUint256
         if (this.config.execute) {
@@ -225,6 +278,7 @@ export class LiquidationBot {
           ...(this.config.execute ? { capital: format(capital) } : {}) })
         const minProfit = ethers.parseUnits(this.config.minProfit, token.decimals)
         for (const borrower of borrowers) {
+          if (this.stopped) return results
           const quote = await vault.previewLiquidation(borrower, capital > 0n ? capital : ethers.MaxUint256)
           if (quote.repayAmount === 0n) continue
           const profit = quote.liquidatorPayout > quote.repayAmount ? quote.liquidatorPayout - quote.repayAmount : 0n
@@ -261,6 +315,11 @@ export class LiquidationBot {
     return results
   }
 
+  // Ctrl+C: the scan stops at its next request, a liquidation in progress is finished first.
+  stop() {
+    this.stopped = true
+  }
+
   close() {
     this.provider.destroy()
   }
@@ -270,8 +329,9 @@ async function main() {
   if (process.argv.includes('--help')) return console.log(HELP)
   const bot = new LiquidationBot(readConfig())
   let stopping = false
-  process.on('SIGINT', () => { stopping = true })
-  process.on('SIGTERM', () => { stopping = true })
+  const stop = () => { stopping = true; bot.stop() }
+  process.on('SIGINT', stop)
+  process.on('SIGTERM', stop)
   try {
     do {
       await bot.runOnce()
